@@ -186,13 +186,18 @@ def convert_pdf_combined_to_markdown(
 
                 src_file = Path(root) / file
                 rel_path = src_file.relative_to(input_path_obj)
-                
+
                 if file.endswith('.pdf.gz'):
                     dest_name = file.replace('.pdf.gz', '.md')
                 else:
                     dest_name = Path(file).stem + '.md'
-                
+
                 dest_file = output_path_obj / rel_path.parent / dest_name
+
+                # Resume: skip already converted files
+                if dest_file.exists():
+                    continue
+
                 tasks.append((src_file, dest_file))
 
     print(f"Found {len(tasks)} valid PDF files to process.")

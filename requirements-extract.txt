@@ -1,0 +1,7 @@
+pandas
+openpyxl
+tqdm
+beautifulsoup4
+html-to-markdown
+PyMuPDF
+warcio

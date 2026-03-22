@@ -95,6 +95,10 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     Convert a single HTML file to markdown.
     Returns: 'converted', 'skipped', or 'failed'
     """
+    # Resume: skip if already converted
+    if output_path.exists():
+        return 'converted'
+
     try:
         # Read HTML file (handle both regular and gzipped)
         if str(html_path).endswith('.gz'):

@@ -18,7 +18,7 @@ import multiprocessing as mp
 
 def process_single_warc_file(warc_file, content_type, output_dir_path):
     """
-    Process a single WARC file to extract HTML or PDF content.
+    Process a single WARC file to extract HTML or PDF content using warcio.
 
     Args:
         warc_file (Path): Path to the WARC file
@@ -28,34 +28,86 @@ def process_single_warc_file(warc_file, content_type, output_dir_path):
     Returns:
         tuple: (warc_filename, success, error_message)
     """
+    from warcio.archiveiterator import ArchiveIterator
+    from urllib.parse import urlparse, unquote
+
+    warc_filename = warc_file.name
+    done_marker = os.path.join(output_dir_path, f".{warc_filename}.done")
+
+    # Resume: skip if already processed
+    if os.path.exists(done_marker):
+        return (warc_filename, True, None)
+
     try:
-        # warc_extractor.py expects the parent directory as -path and will process all WARC files in it
-        # So we need to create a temporary directory structure or call it differently
-        # For now, let's just call it on the parent directory with the specific file
-        warc_file_str = str(warc_file)
+        with open(str(warc_file), 'rb') as stream:
+            for record in ArchiveIterator(stream):
+                if record.rec_type != 'response':
+                    continue
+                if record.http_headers is None:
+                    continue
 
-        # Create a temporary symlink directory approach won't work well
-        # Instead, call warc_extractor directly on the file by putting it in -path
-        # The issue is warc_extractor expects a directory, so we pass the parent and let it find the file
-        # But that would process all files again...
+                # Skip non-2xx HTTP responses (404, 500, 301, etc.)
+                status_code = record.http_headers.get_statuscode()
+                if not status_code or not status_code.startswith('2'):
+                    continue
 
-        # Better approach: Read the warc_extractor code - it treats -path as a directory
-        # We need to work around this limitation
-        # Let's create a temp directory with a symlink to the single file
-        import tempfile
+                http_ct = record.http_headers.get_header('Content-Type', '')
+                if content_type not in http_ct:
+                    continue
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create symlink to the warc file in temp directory
-            temp_link = Path(temp_dir) / warc_file.name
-            temp_link.symlink_to(warc_file.absolute())
+                url = record.rec_headers.get_header('WARC-Target-URI', '')
+                if not url or not url.startswith('http'):
+                    continue
 
-            cmd = f"python warc_extractor.py http:content-type:{content_type} -dump content -error -path {temp_dir} -output_path {output_dir_path}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                try:
+                    parsed = urlparse(unquote(url))
+                    if not parsed.hostname:
+                        continue
 
-            if result.returncode == 0:
-                return (warc_file.name, True, None)
-            else:
-                return (warc_file.name, False, result.stderr)
+                    host = parsed.hostname.replace('www.', '', 1)
+
+                    # Replicate warc_extractor.py path logic exactly so combine_domains.py works unchanged
+                    url_path = parsed.path or '/'
+                    index = url_path.rfind('/') + 1
+                    filename = url_path[index:]
+                    dir_path = url_path[:index]
+
+                    if '.' not in filename:
+                        dir_path = dir_path + filename
+                        if not dir_path.endswith('/'):
+                            dir_path += '/'
+                        filename = 'index.html'
+
+                    dir_path = dir_path.replace('.', '-')
+
+                    full_dir = os.path.join(
+                        output_dir_path,
+                        f"{warc_filename}_{host}",
+                        dir_path.lstrip('/')
+                    )
+                    os.makedirs(full_dir, exist_ok=True)
+
+                    # Handle duplicate filenames
+                    dot_idx = filename.rfind('.')
+                    stem = filename[:dot_idx] if dot_idx >= 0 else filename
+                    suffix = filename[dot_idx:] if dot_idx >= 0 else ''
+                    out_path = os.path.join(full_dir, filename)
+                    n = 0
+                    while os.path.isfile(out_path):
+                        n += 1
+                        out_path = os.path.join(full_dir, f"{stem}({n}){suffix}")
+
+                    content = record.content_stream().read()
+                    with open(out_path, 'wb') as f:
+                        f.write(content)
+
+                except Exception:
+                    continue
+
+        # Mark this WARC as done for resume
+        with open(done_marker, 'w') as f:
+            f.write('done')
+        return (warc_file.name, True, None)
     except Exception as e:
         return (warc_file.name, False, str(e))
 

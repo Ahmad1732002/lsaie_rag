@@ -289,11 +289,17 @@ def combine_domain_folders(domain, folder_list, output_dir):
     Deduplicates files with pattern like name.html, name(1).html, name(2).html.
     Returns file count and timestamp metadata.
     """
+    # Resume: skip if already combined
+    output_path = Path(output_dir) / domain
+    done_marker = Path(output_dir) / f".{domain}.done"
+    if done_marker.exists():
+        print(f"\nSkipping domain (already combined): {domain}")
+        files_count = sum(1 for _ in output_path.rglob('*') if _.is_file())
+        return files_count, {}
+
     print(f"\nProcessing domain: {domain}")
     print(f"  Found {len(folder_list)} folders")
 
-    # Create output directory for this domain
-    output_path = Path(output_dir) / domain
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Track which file to use for each relative path
@@ -338,6 +344,8 @@ def combine_domain_folders(domain, folder_list, output_dir):
         file_key = f"{domain}/{relative_path}"
         timestamp_metadata[file_key] = timestamp.isoformat() if timestamp else None
 
+    # Write done marker for resume
+    done_marker.touch()
     print(f"  ✓ Completed {domain}")
     return len(file_registry), timestamp_metadata
 
