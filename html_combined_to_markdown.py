@@ -7,11 +7,13 @@ Supports exclusion of specific domains and file keywords.
 """
 
 import os
+import re
 import json
 import gzip
 from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
+from bs4 import BeautifulSoup
 from html_to_markdown import convert_to_markdown
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
@@ -90,6 +92,173 @@ def load_allowed_domains(excel_path):
     return allowed_domains
 
 
+# ==========================================
+# Cleaning Constants & Helpers
+# ==========================================
+
+# Frontmatter keys to keep (everything else is UI/tracking noise)
+_KEEP_FRONTMATTER = {
+    'canonical', 'title', 'meta-keywords', 'meta-ethz_lmd',
+    'meta-content-language', 'meta-og:description',
+}
+
+# Google Material Icon names that leak as plain text when icon fonts render
+_MATERIAL_ICONS = {
+    'lock', 'search', 'phone', 'chevron_right', 'chevron_left',
+    'remove', 'add', 'vertical_align_bottom', 'vertical_align_top',
+    'arrow_forward', 'arrow_back', 'arrow_downward', 'arrow_upward',
+    'menu', 'close', 'expand_more', 'expand_less', 'open_in_new',
+    'language', 'person', 'email', 'mail', 'info', 'warning',
+    'check', 'check_circle', 'star', 'home', 'settings', 'share',
+    'print', 'edit', 'delete', 'save', 'cancel', 'done', 'clear',
+    'contacts', 'download', 'upload', 'file_download', 'file_upload',
+    'attach_file', 'public', 'access_time', 'date_range', 'event',
+    'place', 'location_on', 'account_circle', 'group', 'school',
+    'work', 'business', 'contact_page',
+}
+
+_ICON_PATTERN = re.compile(
+    r'\b(' + '|'.join(re.escape(i) for i in _MATERIAL_ICONS) + r')\b'
+)
+
+
+def _clean_html(html_content: str) -> str:
+    """
+    Strip boilerplate HTML elements before markdown conversion.
+    Works on any website. Returns original string on parse error.
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+    except Exception:
+        return html_content
+
+    # Remove non-content tags
+    for tag in soup(['script', 'style', 'noscript', 'iframe']):
+        tag.decompose()
+
+    # Remove semantic layout tags (carry navigation noise on every site)
+    for tag in soup(['header', 'nav', 'footer']):
+        tag.decompose()
+
+    # Remove by ARIA role
+    for tag in soup.find_all(attrs={'role': ['navigation', 'banner', 'contentinfo', 'search']}):
+        tag.decompose()
+
+    # Remove Material Icon elements (<i>/<span> with icon class)
+    for tag in soup.find_all(['i', 'span'], class_=re.compile(r'material.icon|glyphicon|icon[-_]', re.I)):
+        tag.decompose()
+
+    # Remove base64 images (SVG/PNG blobs — meaningless for RAG, very large)
+    for img in soup.find_all('img'):
+        if (img.get('src', '') or '').startswith('data:'):
+            img.decompose()
+
+    # Remove anchors whose href is a data URI (keep their text)
+    for a in soup.find_all('a'):
+        if (a.get('href', '') or '').startswith('data:'):
+            a.unwrap()
+
+    return str(soup)
+
+
+def _clean_frontmatter(text: str) -> str:
+    """Keep only useful frontmatter keys; rename ethz date field to 'date'."""
+    if not text.startswith('---\n'):
+        return text
+    end = text.find('\n---\n', 4)
+    if end == -1:
+        return text
+
+    raw = text[4:end]
+    body = text[end + 5:]
+    kept = []
+
+    for line in raw.splitlines():
+        if ':' in line:
+            key = line.split(':', 1)[0].strip()
+            if key in _KEEP_FRONTMATTER:
+                if key == 'meta-ethz_lmd':
+                    line = 'date:' + line.split(':', 1)[1]
+                kept.append(line)
+
+    if kept:
+        return '---\n' + '\n'.join(kept) + '\n---\n' + body
+    return body
+
+
+def _clean_markdown(text: str) -> str:
+    """
+    Post-process converted markdown to remove remaining noise.
+    Safe on files that have none of these issues — no-ops cleanly.
+    """
+    # 1. Frontmatter whitelist
+    text = _clean_frontmatter(text)
+
+    # 2. Remove Google Tag Manager / analytics URL lines
+    text = re.sub(
+        r'^\[?https?://(?:www\.)?googletagmanager\.com[^\n]*\n?',
+        '', text, flags=re.MULTILINE
+    )
+
+    # 3. Remove base64 image markdown: ![alt](data:image/...base64,...)
+    text = re.sub(r'!\[[^\]]*\]\(data:[^)]+\)', '', text)
+
+    # 4. Remove skip/accessibility link lines ("Directly go to …")
+    text = re.sub(
+        r'^\*\s*\[.*?(?:Directly go to|Press Enter to activate screen reader)[^\]]*\]\([^)]*\)\s*\n?',
+        '', text, flags=re.MULTILINE | re.IGNORECASE
+    )
+
+    # 5. Remove standalone "Header" / "Footer" section headings left by conversion
+    text = re.sub(r'^(Header|Footer)\s*\n-+\s*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#{1,6}\s*(Header|Footer)\s*$\n?', '', text, flags=re.MULTILINE)
+
+    # 6. Remove "JavaScript has been disabled in your browser" notice
+    text = re.sub(
+        r'^JavaScript has been disabled[^\n]*\n?',
+        '', text, flags=re.MULTILINE | re.IGNORECASE
+    )
+
+    # 7. Clean Material Icon text that leaked through HTML→markdown conversion
+    def _process_line(line):
+        stripped = line.lstrip('* -\t')
+        prefix = line[:len(line) - len(stripped)]
+
+        # Line starts with icon word then real content → strip only the icon prefix
+        m = re.match(
+            r'^(' + '|'.join(re.escape(i) for i in _MATERIAL_ICONS) + r')\s+(.+)',
+            stripped
+        )
+        if m:
+            return prefix + m.group(2)
+
+        # Line is entirely icon words + punctuation → drop the whole line
+        if _ICON_PATTERN.search(stripped):
+            remainder = _ICON_PATTERN.sub('', stripped).strip()
+            if re.fullmatch(r'[\s\*\-\[\]\(\)\|\.,:;]*', remainder):
+                return None  # signal to drop
+
+        return line
+
+    lines = []
+    for line in text.splitlines():
+        result = _process_line(line)
+        if result is not None:
+            lines.append(result)
+    text = '\n'.join(lines)
+
+    # 8. Remove "contactsvCard" artifact (contacts icon + vCard text)
+    text = re.sub(r'contacts\s*vCard\s*', '', text, flags=re.IGNORECASE)
+
+    # 9. Collapse 3+ consecutive blank lines → 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # 10. Strip trailing whitespace per line
+    text = '\n'.join(line.rstrip() for line in text.splitlines())
+
+    return text.strip()
+
+
 def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     """
     Convert a single HTML file to markdown.
@@ -121,7 +290,10 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         else:
             html_content = html_content.encode('utf-8', errors='ignore').decode('utf-8')
 
-        # 2. ROBUST CONVERSION
+        # 2. PRE-CLEAN HTML (remove nav/header/footer/base64/icon tags)
+        html_content = _clean_html(html_content)
+
+        # 3. ROBUST CONVERSION
         try:
             markdown_text = convert_to_markdown(html_content)
         except BaseException:
@@ -130,6 +302,13 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
 
         # Skip empty or redirect-only files
         if markdown_text in ("", "Redirecting"):
+            return 'skipped'
+
+        # 4. POST-CLEAN MARKDOWN (frontmatter, GTM, icon text, blank lines)
+        markdown_text = _clean_markdown(markdown_text)
+
+        # Skip if cleaning left nothing
+        if not markdown_text:
             return 'skipped'
 
         # Create output directory if needed
